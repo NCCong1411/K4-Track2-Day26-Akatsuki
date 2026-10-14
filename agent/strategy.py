@@ -1,55 +1,11 @@
-"""agent/strategy.py — discovery, delegation, caching, replica, and budget
-POLICY. Where `agent/gateway.py` is the control plane (route / admit /
-authorize / budget — the four JOBS a decision must do), this file is the
-building blocks a real answer to those jobs is made of. Nothing here is
-wired into `Gateway.decide` by default — see agent/gateway.py's own module
-docstring and agent/README.md's table for where each piece is meant to
-plug in. That wiring is the assignment, not a step you're missing.
+"""Pure routing, budgeting and result-cache policy for the Day 26 agent.
 
-THE ARITHMETIC THAT MAKES THIS FILE'S EXISTENCE THE LESSON
-----------------------------------------------------------------------------
-A duel gives EACH SIDE 100 credits, ONCE, for all 10 rounds combined
-(CONTRACTS.md 4.2's `GatewayContext.credits`; FINAL-PLAN.md section 4). Two
-ways to spend a single round, both real, both computed against
-`kit.mcp.specs.TOOL_SPECS` (this file's `__main__` demo below recomputes
-them live rather than just asserting the numbers, so they can never
-silently drift from the real cost table):
-
-    DISCIPLINED  slides.query(fields=[title,body])   base1 + (body3+title1) + 1row*1  =  6
-                 slides.get_frame(default fields)     base2 + (body2+title0)          =  4
-                 registry.provenance(default fields)  base1 + (etag0)                 =  1
-                 -------------------------------------------------------
-                 = 11 credits this round — the CEILING of FINAL-PLAN.md 4.3's
-                   "8-11" (a round that skips the provenance re-read, or
-                   reuses a cached body via `ResultCache` below, lands
-                   nearer the floor of that range instead).
-
-    CARELESS     registry.list_servers(fields=[*])    ->            12
-                 glossary.list_terms()  (default==full "punishment
-                                          button", not a narrow mask) -> 10
-                 slides.get_frame(fields=[*]) x3       ->  9 x 3   = 27
-                 -------------------------------------------------------
-                 = 49 credits — MORE THAN ONE THIRD OF THE WHOLE DUEL'S
-                   BUDGET, spent in a single round.
-
-Play at the DISCIPLINED CEILING (11 cr) every single round and 10 rounds
-costs 110 — a hair OVER the 100-credit pool: this file's own `__main__`
-demo shows that combination surviving nine full rounds and only running dry
-paying for the tenth. That is not a bug in the arithmetic; it is the honest
-point — "disciplined" is not a magic number, it is not re-paying for the
-same provenance read or the same frame body every round when you already
-have it (`ResultCache` below, and `BudgetPacer.is_affordable`'s reserve
-floor). Play CARELESS even once and you are mathematically bankrupt by
-round 3 (100 − 49 − 49 < 0) — not because the game is rigged against you,
-but because `registry.list_servers` and `glossary.list_terms` were
-deliberately built so their DEFAULT field mask is their full, expensive
-dump (FINAL-PLAN.md section 4.1: "an audit showed `list_servers` and
-`list_terms` each exceeded a whole round's sustainable allowance —
-punishment buttons, not decisions"). Naming exactly the fields you plan to
-actually CITE, every time, is not a minor optimisation here; it is the
-difference between finishing the duel and not.
-
-Stdlib only. No network, no randomness, no wall-clock reads.
+The kit prices tools from TOOL_SPECS. A disciplined query/body/provenance
+round costs nine credits under the current table; the 100-credit duel
+budget still requires pacing across ten rounds. Catalog defaults are costly.
+Replica drift alone establishes no freshness direction: choose only from
+provenance. Cached results require the same round, replica, etag and mask.
+No network, files, randomness or wall-clock reads.
 """
 
 from __future__ import annotations
@@ -256,73 +212,50 @@ class ReplicaChoice:
     reason: str
 
 
-def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bool = True) -> ReplicaChoice:
-    """A starting heuristic for JOB 1 (ROUTE) in `agent/gateway.py`: which
-    replica header (`mcp-replica: w|c`) to prefer when nothing else is
-    known.
+def pick_replica(*, path_id: str | None, known_drifting: bool,
+                 prefers_fresh: bool = True,
+                 proven_fresher: str | None = None) -> ReplicaChoice:
+    """Prefer the proven fresher replica; drift alone proves no direction.
 
-    `known_drifting` is YOUR OWN judgement call, not something this
-    function derives — a real implementation reads it from a
-    `registry.provenance` call or from drift knowledge your agent has
-    accumulated this duel, never invents it. `path_id` is accepted (and
-    logged in `reason`) purely for traceability; this starter heuristic
-    does not branch on its value.
-
-    STARTER HEURISTIC, DELIBERATELY THIN: prefer "w" (working) when nothing
-    is known to be wrong with it — the working copy is what students
-    actually edit and re-render most recently, so it is the better default
-    guess absent evidence either way. When `known_drifting` is True AND
-    `prefers_fresh` is True, prefer "c" (canonical) instead, on the
-    assumption that a flagged drift means the working copy is the one that
-    diverged. THIS ASSUMPTION IS OFTEN WRONG — CORPUS-FACTS.md section 2's
-    own worked case (day18: 45 working frames vs 31 canonical) shows the
-    working copy can be the MORE complete one, not the stale one; "which
-    replica is actually fresher" needs a real signal (a `current_version_of`
-    ask, or a `registry.provenance` timestamp), not a coin flip on which
-    letter comes first. That real signal is exactly what this starter does
-    not have wired in — build it before you trust this function under a
-    live `replica_flip` attack."""
-    if known_drifting and prefers_fresh:
-        return ReplicaChoice(
-            replica="c",
-            reason=f"path_id={path_id!r} is known to drift this duel; preferring canonical as the naive fresher guess",
-        )
-    return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no known drift; default to working")
+    Without provenance, w is only a routing default. A current-version
+    answer still needs both replicas compared before claiming freshness.
+    """
+    if proven_fresher not in (None, "w", "c"):
+        raise ValueError("proven_fresher must be 'w', 'c', or None")
+    if prefers_fresh and proven_fresher:
+        return ReplicaChoice(proven_fresher,
+                             f"path_id={path_id!r}: provenance establishes {proven_fresher} as fresher")
+    qualifier = "drift unresolved" if known_drifting else "freshness not compared"
+    return ReplicaChoice("w", f"path_id={path_id!r}: default route only; {qualifier}")
 
 
 @dataclass
 class ResultCache:
-    """A per-duel memory of `(anchor, fields)` you have ALREADY PAID FOR —
-    `agent/gateway.py`'s `Gateway` lives for the whole duel (CONTRACTS.md
-    4.3), so this cache can too, and a hit here is a call your `budget` job
-    never needs to forward at all.
+    """Cache only a result from the same round, replica, etag and field mask.
 
-    THE CAVEAT THAT MATTERS MORE THAN THE CACHE: a cached body is a
-    snapshot from whenever you first fetched it. Under an active
-    `replica_flip` or `poisoned_result` mutation (CONTRACTS.md section 8),
-    the SAME anchor can legitimately answer differently on a later round.
-    Treat a cache hit as "I already have grounds to say this, and I paid
-    for them once" — never as "this is still true right now" without
-    re-confirming when a round's attack card gives you a specific reason to
-    doubt it. A cache that is trusted blindly is exactly how a `stale_read`
-    (CONTRACTS.md 6.4) happens for free.
+    Missing metadata yields a miss or is not stored, preserving the old call
+    shape without granting stale content authority in a later round.
+    """
 
-    Keys are `(anchor, tuple(sorted(fields)))` — the SAME anchor requested
-    with a NARROWER mask than what's cached is still a genuine cache miss
-    (you never paid for the field you'd be citing), which is why the key
-    includes the mask, not just the anchor."""
-
-    _store: dict[tuple[str, tuple[str, ...]], Mapping[str, Any]] = field(default_factory=dict)
+    _store: dict[tuple[int, str, str, str, tuple[str, ...]], Mapping[str, Any]] = field(default_factory=dict)
 
     @staticmethod
-    def _key(anchor: str, fields: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
-        return (anchor, tuple(sorted(fields)))
+    def _key(anchor: str, fields: tuple[str, ...], round_no: int,
+             replica: str, etag: str) -> tuple[int, str, str, str, tuple[str, ...]]:
+        return (round_no, replica, etag, anchor, tuple(sorted(set(fields))))
 
-    def get(self, anchor: str, fields: tuple[str, ...]) -> Mapping[str, Any] | None:
-        return self._store.get(self._key(anchor, fields))
+    def get(self, anchor: str, fields: tuple[str, ...], *, round_no: int | None = None,
+            replica: str | None = None, etag: str | None = None) -> Mapping[str, Any] | None:
+        if round_no is None or replica not in ("w", "c") or not etag:
+            return None
+        return self._store.get(self._key(anchor, fields, round_no, replica, etag))
 
-    def put(self, anchor: str, fields: tuple[str, ...], row: Mapping[str, Any]) -> None:
-        self._store[self._key(anchor, fields)] = dict(row)
+    def put(self, anchor: str, fields: tuple[str, ...], row: Mapping[str, Any], *,
+            round_no: int | None = None, replica: str | None = None,
+            etag: str | None = None) -> None:
+        if round_no is None or replica not in ("w", "c") or not etag:
+            return
+        self._store[self._key(anchor, fields, round_no, replica, etag)] = dict(row)
 
     def __len__(self) -> int:
         return len(self._store)
@@ -404,13 +337,9 @@ if __name__ == "__main__":
         f"  disciplined (ceiling, {disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
         f"credits_left={disciplined_pacer.credits_left} bankrupt_by={disciplined_pacer.bankrupt_by()}"
     )
-    # Even the CEILING of "disciplined" (paying full price for query + get_frame
-    # + provenance, EVERY round, with no caching at all) survives nine full
-    # rounds and only runs dry paying for the tenth -- a sharp contrast with
-    # careless play below, and the honest reason ResultCache/pacing exist:
-    # not needing all three calls every round is what buys the margin
-    # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
+    # The retuned kit economy makes this 9 credits per round, leaving ten.
+    assert disciplined_pacer.bankrupt_by() is None
+    assert disciplined_pacer.credits_left == 100 - ROUNDS_PER_DUEL * disciplined
     nine_rounds_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
         nine_rounds_pacer.record_spend(round_no, disciplined)
@@ -445,17 +374,21 @@ if __name__ == "__main__":
     print(f"  known_drifting=False -> {choice_clean}")
     print(f"  known_drifting=True  -> {choice_drifting}")
     assert choice_clean.replica == "w"
-    assert choice_drifting.replica == "c"
+    assert choice_drifting.replica == "w"  # drift alone does not prove freshness
+    assert pick_replica(path_id="d8f95a7b", known_drifting=True,
+                        proven_fresher="c").replica == "c"
 
     print("\n=== ResultCache: same (anchor, fields) is a hit; a wider mask is a genuine miss ===\n")
     cache = ResultCache()
     anchor = "Frame:3f2a9c11/w/041"
     assert cache.get(anchor, ("title", "body")) is None
-    cache.put(anchor, ("title", "body"), {"title": "Streamable HTTP", "body": "..."})
-    hit = cache.get(anchor, ("body", "title"))  # order-insensitive, same key
+    cache.put(anchor, ("title", "body"), {"title": "Streamable HTTP", "body": "..."},
+              round_no=1, replica="w", etag="sha256:one")
+    hit = cache.get(anchor, ("body", "title"), round_no=1, replica="w", etag="sha256:one")
     print(f"  cache.get(anchor, ('body','title')) after put(('title','body')) -> {hit}")
     assert hit == {"title": "Streamable HTTP", "body": "..."}
-    miss = cache.get(anchor, ("title", "body", "meta"))
+    miss = cache.get(anchor, ("title", "body", "meta"), round_no=1,
+                     replica="w", etag="sha256:one")
     print(f"  cache.get(anchor, wider mask incl. 'meta') -> {miss}  (a real miss, not stale data)")
     assert miss is None
     assert len(cache) == 1
